@@ -2,15 +2,20 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"debug/elf"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -71,21 +76,61 @@ type perfEventAttr struct {
 	BPLen        uint64
 }
 
+type options struct {
+	objPath        string
+	port           int
+	mode           string
+	format         string
+	duration       time.Duration
+	maxConnections int
+}
+
+type connectEvent struct {
+	Process string
+	PID     string
+	FD      string
+	Dst     string
+	Port    int
+	Raw     string
+}
+
+type connectStats struct {
+	Total     int
+	ByProcess map[string]int
+	ByDst     map[string]int
+}
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(); err != nil && !errors.Is(err, flag.ErrHelp) {
 		log.Fatal(err)
 	}
 }
 
 func run() error {
-	// The Makefile builds this object from bpf/connectsnoop.bpf.c.
-	objPath := "bpf/connectsnoop.bpf.o"
-	if len(os.Args) > 1 {
-		objPath = os.Args[1]
+	opts, err := parseOptions(os.Args[1:])
+	if err != nil {
+		return err
 	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return errors.New("connectsnoop currently requires Linux amd64")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if opts.duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.duration)
+		defer cancel()
+	}
+	if opts.mode == "inbound" {
+		return runInbound(ctx, opts, os.Stdout, os.Stderr)
+	}
+	return runOutbound(ctx, opts)
+}
+
+func runOutbound(ctx context.Context, opts options) error {
 
 	// Pull raw eBPF bytecode and license text out of the ELF object.
-	insns, license, err := readBPFObject(objPath, tracepointSection)
+	insns, license, err := readBPFObject(opts.objPath, tracepointSection)
 	if err != nil {
 		return err
 	}
@@ -113,8 +158,61 @@ func run() error {
 	}
 	defer closeAll(perfFDs)
 
-	fmt.Println("attached to sys_enter_connect; press Ctrl-C to stop")
-	return tailTracePipe(tracePipePath)
+	if opts.port > 0 {
+		fmt.Printf("attached to sys_enter_connect; tracking destination port %d; press Ctrl-C to stop\n", opts.port)
+	} else {
+		fmt.Println("attached to sys_enter_connect; tracking all destination ports; press Ctrl-C to stop")
+	}
+	return tailTracePipe(ctx, tracePipePath, opts.port)
+}
+
+func parseOptions(args []string) (options, error) {
+	var opts options
+
+	flags := flag.NewFlagSet("connectsnoop", flag.ContinueOnError)
+	flags.StringVar(&opts.objPath, "obj", opts.objPath, "path to eBPF object file")
+	flags.IntVar(&opts.port, "port", 0, "local server port (inbound) or destination port (outbound); 0 for all")
+	flags.StringVar(&opts.mode, "mode", "inbound", "inbound lifecycle or outbound connect attempts")
+	flags.StringVar(&opts.format, "format", "text", "inbound output format: text or json (JSON Lines)")
+	flags.DurationVar(&opts.duration, "duration", 0, "stop after this duration, e.g. 30s; 0 waits for Ctrl-C")
+	flags.IntVar(&opts.maxConnections, "max-connections", 16384, "maximum concurrently tracked inbound connections")
+	if err := flags.Parse(args); err != nil {
+		return opts, err
+	}
+
+	// Keep the old positional form working: sudo ./bin/connectsnoop bpf/file.o.
+	if flags.NArg() > 1 {
+		return opts, fmt.Errorf("usage: connectsnoop [-port N] [-obj bpf/connectsnoop.bpf.o]")
+	}
+	if flags.NArg() == 1 {
+		opts.objPath = flags.Arg(0)
+	}
+
+	if opts.port < 0 || opts.port > 65535 {
+		return opts, fmt.Errorf("port must be between 0 and 65535")
+	}
+	if opts.mode != "inbound" && opts.mode != "outbound" {
+		return opts, errors.New("mode must be inbound or outbound")
+	}
+	if opts.format != "text" && opts.format != "json" {
+		return opts, errors.New("format must be text or json")
+	}
+	if opts.mode == "outbound" && opts.format != "text" {
+		return opts, errors.New("outbound mode only supports text output")
+	}
+	if opts.duration < 0 {
+		return opts, errors.New("duration must not be negative")
+	}
+	if opts.maxConnections < 1 || opts.maxConnections > 1048576 {
+		return opts, errors.New("max-connections must be between 1 and 1048576")
+	}
+	if opts.objPath == "" {
+		opts.objPath = "bpf/lifecycle.bpf.o"
+		if opts.mode == "outbound" {
+			opts.objPath = "bpf/connectsnoop.bpf.o"
+		}
+	}
+	return opts, nil
 }
 
 func readBPFObject(path, sectionName string) ([]byte, string, error) {
@@ -233,7 +331,7 @@ func openTracepointPerfEvent(tracepointID uint64, cpu int) (int, error) {
 	return int(fd), nil
 }
 
-func tailTracePipe(path string) error {
+func tailTracePipe(ctx context.Context, path string, portFilter int) error {
 	// bpf_trace_printk writes into trace_pipe. Reading it consumes the stream.
 	file, err := os.Open(path)
 	if err != nil {
@@ -241,27 +339,167 @@ func tailTracePipe(path string) error {
 	}
 	defer file.Close()
 
-	// Closing trace_pipe unblocks Scanner when Ctrl-C arrives.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	stats := connectStats{
+		ByProcess: make(map[string]int),
+		ByDst:     make(map[string]int),
+	}
+
+	// Closing trace_pipe unblocks Scanner on a signal or capture deadline.
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-sig
-		_ = file.Close()
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+		case <-done:
+		}
 	}()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// trace_pipe includes all tracing output, so show only this sample's lines.
-		if strings.Contains(line, "connect fd=") {
-			fmt.Println(line)
+		event, ok := parseConnectEvent(line)
+		if !ok {
+			continue
 		}
+		if portFilter > 0 && event.Port != portFilter {
+			continue
+		}
+
+		stats.Add(event)
+		fmt.Printf("%s pid=%s fd=%s dst=%s port=%d\n", event.Process, event.PID, event.FD, event.Dst, event.Port)
 	}
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
 		return fmt.Errorf("read trace_pipe: %w", err)
 	}
+	stats.Print(portFilter)
 	return nil
+}
+
+func parseConnectEvent(line string) (connectEvent, bool) {
+	idx := strings.Index(line, "connect fd=")
+	if idx < 0 {
+		return connectEvent{}, false
+	}
+
+	event := connectEvent{
+		Process: "unknown",
+		PID:     "unknown",
+		Raw:     line,
+	}
+	event.Process, event.PID = parseTracePipeProcess(line[:idx])
+
+	fields := strings.Fields(line[idx:])
+	if len(fields) < 3 || fields[0] != "connect" {
+		return connectEvent{}, false
+	}
+
+	fd, ok := strings.CutPrefix(fields[1], "fd=")
+	if !ok {
+		return connectEvent{}, false
+	}
+	event.FD = fd
+
+	dst, ok := strings.CutPrefix(fields[2], "dst=")
+	if !ok {
+		return connectEvent{}, false
+	}
+
+	host, port, ok := splitHostPort(dst)
+	if !ok {
+		return connectEvent{}, false
+	}
+	event.Dst = host
+	event.Port = port
+
+	return event, true
+}
+
+func parseTracePipeProcess(prefix string) (string, string) {
+	beforeCPU, _, ok := strings.Cut(prefix, "[")
+	if !ok {
+		return "unknown", "unknown"
+	}
+
+	commPID := strings.TrimSpace(beforeCPU)
+	dash := strings.LastIndex(commPID, "-")
+	if dash <= 0 || dash == len(commPID)-1 {
+		return commPID, "unknown"
+	}
+
+	return commPID[:dash], commPID[dash+1:]
+}
+
+func splitHostPort(dst string) (string, int, bool) {
+	if strings.HasPrefix(dst, "[") {
+		closeBracket := strings.LastIndex(dst, "]:")
+		if closeBracket < 0 {
+			return "", 0, false
+		}
+		port, err := strconv.Atoi(dst[closeBracket+2:])
+		if err != nil {
+			return "", 0, false
+		}
+		return dst[:closeBracket+1], port, true
+	}
+
+	colon := strings.LastIndex(dst, ":")
+	if colon < 0 {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(dst[colon+1:])
+	if err != nil {
+		return "", 0, false
+	}
+	return dst[:colon], port, true
+}
+
+func (s *connectStats) Add(event connectEvent) {
+	s.Total++
+	s.ByProcess[event.Process]++
+	s.ByDst[event.Dst]++
+}
+
+func (s connectStats) Print(portFilter int) {
+	if portFilter > 0 {
+		fmt.Printf("\nsummary for destination port %d\n", portFilter)
+	} else {
+		fmt.Println("\nsummary for all destination ports")
+	}
+	fmt.Printf("total connect attempts: %d\n", s.Total)
+
+	printTop("by process", s.ByProcess)
+	printTop("by destination", s.ByDst)
+}
+
+func printTop(title string, values map[string]int) {
+	if len(values) == 0 {
+		return
+	}
+
+	type entry struct {
+		Name  string
+		Count int
+	}
+	entries := make([]entry, 0, len(values))
+	for name, count := range values {
+		entries = append(entries, entry{Name: name, Count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count == entries[j].Count {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries[i].Count > entries[j].Count
+	})
+
+	fmt.Println(title + ":")
+	for i, entry := range entries {
+		if i == 5 {
+			break
+		}
+		fmt.Printf("  %s: %d\n", entry.Name, entry.Count)
+	}
 }
 
 func onlineCPUs() ([]int, error) {
